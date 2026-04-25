@@ -474,8 +474,8 @@ class TeamService:
                     beta_settings = settings_result["data"].get("beta_settings", {})
                     device_code_auth_enabled = beta_settings.get("codex_device_code_auth", False)
 
-                # 确定状态和最大成员数 (默认 6)
-                max_members = 6
+                # 确定状态和最大成员数 (默认 5)
+                max_members = 5
                 status = "active"
                 if occupied_slots >= max_members:
                     status = "full"
@@ -724,7 +724,14 @@ class TeamService:
         """
         try:
             # 1. 解析文本
-            parsed_data = self.token_parser.parse_team_import_text(text)
+            try:
+                parsed_data = self.token_parser.parse_team_import_content(text)
+            except ValueError as e:
+                yield {
+                    "type": "error",
+                    "error": str(e)
+                }
+                return
 
             if not parsed_data:
                 yield {

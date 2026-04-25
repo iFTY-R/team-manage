@@ -2,8 +2,9 @@
 Token 正则匹配工具
 用于从文本中提取 AT Token、邮箱、Account ID 等信息
 """
+import json
 import re
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,183 @@ class TokenParser:
 
     # Client ID 正则 (严格匹配 app_ 开头)
     CLIENT_ID_PATTERN = r'app_[A-Za-z0-9]+'
+
+    def _clean_optional_text(self, value: Any) -> Optional[str]:
+        """
+        清洗可选文本值
+
+        Args:
+            value: 原始值
+
+        Returns:
+            去除首尾空白后的字符串, 空值返回 None
+        """
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+
+        value = str(value).strip()
+        return value or None
+
+    def _looks_like_json_content(self, text: str) -> bool:
+        """
+        判断输入内容是否应按 JSON 解析
+
+        说明:
+        - 兼容旧的 `[email]----[token]----[uuid]` 文本格式
+        - 仅在内容明显像 JSON 时才进入 JSON 解析分支
+        """
+        stripped = text.strip()
+        if not stripped:
+            return False
+
+        if stripped.startswith("{"):
+            return True
+
+        if stripped.startswith("["):
+            first_line = stripped.splitlines()[0].strip()
+            if re.match(r'^\[[^\]]+\]\s*----', first_line):
+                return False
+            if "----" in first_line:
+                return False
+            return True
+
+        return False
+
+    def _normalize_team_import_record(
+        self,
+        access_token: Optional[str] = None,
+        email: Optional[str] = None,
+        account_id: Optional[str] = None,
+        refresh_token: Optional[str] = None,
+        session_token: Optional[str] = None,
+        client_id: Optional[str] = None
+    ) -> Dict[str, Optional[str]]:
+        """
+        统一 Team 导入记录结构
+        """
+        return {
+            "token": self._clean_optional_text(access_token),
+            "email": self._clean_optional_text(email),
+            "account_id": self._clean_optional_text(account_id),
+            "refresh_token": self._clean_optional_text(refresh_token),
+            "session_token": self._clean_optional_text(session_token),
+            "client_id": self._clean_optional_text(client_id)
+        }
+
+    def _is_cpa_json_item(self, item: Dict[str, Any]) -> bool:
+        """
+        判断是否为 CPA 风格 JSON
+        """
+        return any(key in item for key in ("access_token", "refresh_token", "account_id", "email", "id_token"))
+
+    def _is_cockpit_tools_json_item(self, item: Dict[str, Any]) -> bool:
+        """
+        判断是否为 cockpit-tools 风格 JSON
+        """
+        tokens = item.get("tokens")
+        return isinstance(tokens, dict)
+
+    def _parse_cpa_json_item(self, item: Dict[str, Any], index: int) -> Dict[str, Optional[str]]:
+        """
+        解析 CPA 风格 JSON 项
+        """
+        record = self._normalize_team_import_record(
+            access_token=item.get("access_token"),
+            email=item.get("email"),
+            account_id=item.get("account_id"),
+            refresh_token=item.get("refresh_token"),
+            session_token=item.get("session_token"),
+            client_id=item.get("client_id")
+        )
+
+        if not any([record["token"], record["refresh_token"], record["session_token"]]):
+            raise ValueError(f"第 {index} 项缺少可用于导入的 Access Token / Refresh Token / Session Token")
+
+        return record
+
+    def _parse_cockpit_tools_json_item(self, item: Dict[str, Any], index: int) -> Dict[str, Optional[str]]:
+        """
+        解析 cockpit-tools 风格 JSON 项
+        """
+        tokens = item.get("tokens") or {}
+
+        record = self._normalize_team_import_record(
+            access_token=tokens.get("access_token") or item.get("access_token"),
+            email=item.get("email"),
+            account_id=item.get("account_id"),
+            refresh_token=tokens.get("refresh_token") or item.get("refresh_token"),
+            session_token=tokens.get("session_token") or item.get("session_token"),
+            client_id=tokens.get("client_id") or item.get("client_id")
+        )
+
+        if not any([record["token"], record["refresh_token"], record["session_token"]]):
+            raise ValueError(f"第 {index} 项缺少可用于导入的 Access Token / Refresh Token / Session Token")
+
+        return record
+
+    def parse_team_import_json(self, data: Any) -> List[Dict[str, Optional[str]]]:
+        """
+        解析 Team 导入 JSON
+
+        仅支持:
+        - CPA 风格对象 / 对象数组
+        - cockpit-tools 风格对象 / 对象数组
+        """
+        if isinstance(data, dict):
+            items = [data]
+        elif isinstance(data, list):
+            items = data
+        else:
+            raise ValueError("JSON 导入内容必须是对象或对象数组")
+
+        if not items:
+            raise ValueError("JSON 导入内容为空")
+
+        results = []
+
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"第 {index} 项不是对象，无法导入")
+
+            if self._is_cockpit_tools_json_item(item):
+                results.append(self._parse_cockpit_tools_json_item(item, index))
+                continue
+
+            if self._is_cpa_json_item(item):
+                results.append(self._parse_cpa_json_item(item, index))
+                continue
+
+            raise ValueError(
+                f"第 {index} 项不是支持的 JSON 导入格式，仅支持 CPA 格式和 cockpit-tools 格式"
+            )
+
+        logger.info(f"JSON 解析完成,共提取 {len(results)} 条 Team 信息")
+        return results
+
+    def parse_team_import_content(self, text: str) -> List[Dict[str, Optional[str]]]:
+        """
+        统一解析 Team 导入内容
+
+        - JSON 内容: 仅支持 CPA 格式和 cockpit-tools 格式中定义的两类结构
+        - 其他内容: 回退到现有文本解析逻辑
+        """
+        stripped = text.strip()
+        if not stripped:
+            return []
+
+        if self._looks_like_json_content(stripped):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"JSON 格式无效: {exc.msg}") from exc
+
+            return self.parse_team_import_json(payload)
+
+        return self.parse_team_import_text(text)
 
     def extract_jwt_tokens(self, text: str) -> List[str]:
         """

@@ -218,7 +218,8 @@ async function handleSingleImport(event) {
 async function handleBatchImport(event) {
     event.preventDefault();
     const form = event.target;
-    const batchContent = form.batchContent.value.trim();
+    const batchTextContent = form.batchContent.value.trim();
+    const batchFile = form.batchFile && form.batchFile.files ? form.batchFile.files[0] : null;
     const submitButton = form.querySelector('button[type="submit"]');
 
     // UI 元素
@@ -247,6 +248,21 @@ async function handleBatchImport(event) {
     submitButton.textContent = '导入中...';
 
     try {
+        let batchContent = batchTextContent;
+
+        if (batchFile) {
+            const fileName = batchFile.name ? batchFile.name.toLowerCase() : '';
+            if (!fileName.endsWith('.json')) {
+                throw new Error('仅支持上传 .json 文件');
+            }
+
+            batchContent = (await batchFile.text()).trim();
+        }
+
+        if (!batchContent) {
+            throw new Error('请粘贴导入内容或选择一个 .json 文件');
+        }
+
         const response = await fetch('/admin/teams/import', {
             method: 'POST',
             headers: {

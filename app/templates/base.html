@@ -151,8 +151,14 @@
                     <form id="batchImportForm" onsubmit="handleBatchImport(event)">
                         <div class="form-group">
                             <label>批量导入内容 <span class="required">*</span></label>
-                            <textarea name="batchContent" class="form-control" rows="8" placeholder="一行一个 AT Token..."
-                                required></textarea>
+                            <textarea name="batchContent" class="form-control" rows="8"
+                                placeholder="可粘贴 JSON 或旧文本导入内容..."></textarea>
+                            <small class="form-text">支持旧文本批量导入，也支持直接粘贴 CPA / cockpit-tools JSON</small>
+                        </div>
+                        <div class="form-group">
+                            <label>或上传 JSON 文件</label>
+                            <input type="file" name="batchFile" class="form-control" accept=".json,application/json">
+                            <small class="form-text">仅支持 CPA / cockpit-tools 结构</small>
                         </div>
                         <div id="batchProgressContainer" style="display: none; margin-bottom: 1.5rem;">
                             <div class="progress-info"
