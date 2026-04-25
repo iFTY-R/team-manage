@@ -5,14 +5,14 @@
 import logging
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-import json
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
 from app.database import get_db
 from app.dependencies.auth import require_admin
 from app.services.team import TeamService
+from app.services.cpa import cpa_service_manager
 from app.services.redemption import RedemptionService
 from app.utils.time_utils import get_now
 
@@ -24,24 +24,9 @@ router = APIRouter(
     tags=["admin"]
 )
 
-import json
-
 # 服务实例
 team_service = TeamService()
 redemption_service = RedemptionService()
-
-
-# 请求模型
-class TeamImportRequest(BaseModel):
-    """Team 导入请求"""
-    import_type: str = Field(..., description="导入类型: single 或 batch")
-    access_token: Optional[str] = Field(None, description="AT Token (单个导入)")
-    refresh_token: Optional[str] = Field(None, description="Refresh Token (单个导入)")
-    session_token: Optional[str] = Field(None, description="Session Token (单个导入)")
-    client_id: Optional[str] = Field(None, description="Client ID (单个导入)")
-    email: Optional[str] = Field(None, description="邮箱 (单个导入)")
-    account_id: Optional[str] = Field(None, description="Account ID (单个导入)")
-    content: Optional[str] = Field(None, description="批量导入内容")
 
 
 class AddMemberRequest(BaseModel):
@@ -59,19 +44,6 @@ class CodeGenerateRequest(BaseModel):
     warranty_days: int = Field(30, description="质保天数")
 
 
-class TeamUpdateRequest(BaseModel):
-    """Team 更新请求"""
-    email: Optional[str] = Field(None, description="新邮箱")
-    account_id: Optional[str] = Field(None, description="新 Account ID")
-    access_token: Optional[str] = Field(None, description="新 Access Token")
-    refresh_token: Optional[str] = Field(None, description="新 Refresh Token")
-    session_token: Optional[str] = Field(None, description="新 Session Token")
-    client_id: Optional[str] = Field(None, description="新 Client ID")
-    max_members: Optional[int] = Field(None, description="最大成员数")
-    team_name: Optional[str] = Field(None, description="Team 名称")
-    status: Optional[str] = Field(None, description="状态: active/full/expired/error/banned")
-
-
 class CodeUpdateRequest(BaseModel):
     """兑换码更新请求"""
     has_warranty: bool = Field(..., description="是否为质保兑换码")
@@ -87,6 +59,20 @@ class BulkCodeUpdateRequest(BaseModel):
 class BulkActionRequest(BaseModel):
     """批量操作请求"""
     ids: List[int] = Field(..., description="Team ID 列表")
+
+
+class CPAServiceRequest(BaseModel):
+    """CPA 服务配置请求"""
+    name: str = Field(..., description="服务名称")
+    api_url: str = Field(..., description="管理 API 地址")
+    api_token: Optional[str] = Field("", description="管理 API Token")
+    proxy: Optional[str] = Field("", description="可选代理地址")
+    enabled: bool = Field(True, description="是否启用")
+
+
+class CPAMotherSelectionRequest(BaseModel):
+    """CPA 母号选择请求"""
+    names: List[str] = Field(default_factory=list, description="auth-file 文件名列表")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -110,7 +96,9 @@ async def admin_dashboard(
         # per_page = 20 (Removed hardcoded value)
         
         # 获取 Team 列表 (分页)
-        teams_result = await team_service.get_all_teams(db, page=page, per_page=per_page, search=search, status=status)
+        teams_result = await team_service.get_all_teams(
+            db, page=page, per_page=per_page, search=search, status=status, source_type="cpa"
+        )
         
         # 获取统计信息 (使用专用统计方法优化)
         team_stats = await team_service.get_stats(db)
@@ -218,121 +206,32 @@ async def get_team_info(
 @router.post("/teams/{team_id}/update")
 async def update_team(
     team_id: int,
-    update_data: TeamUpdateRequest,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin)
 ):
-    """更新 Team 信息"""
-    try:
-        result = await team_service.update_team(
-            team_id=team_id,
-            db_session=db,
-            email=update_data.email,
-            account_id=update_data.account_id,
-            access_token=update_data.access_token,
-            refresh_token=update_data.refresh_token,
-            session_token=update_data.session_token,
-            client_id=update_data.client_id,
-            max_members=update_data.max_members,
-            team_name=update_data.team_name,
-            status=update_data.status
-        )
-        if not result["success"]:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=result
-            )
-        return JSONResponse(content=result)
-    except Exception as e:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"success": False, "error": str(e)}
-        )
+    return JSONResponse(
+        status_code=status.HTTP_410_GONE,
+        content={
+            "success": False,
+            "error": "本地 Team 编辑入口已下线，请改为通过 CPA 母号同步维护 Team 投影"
+        }
+    )
 
 
 
 
 @router.post("/teams/import")
 async def team_import(
-    import_data: TeamImportRequest,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin)
 ):
-    """
-    处理 Team 导入
-
-    Args:
-        import_data: 导入数据
-        db: 数据库会话
-        current_user: 当前用户（需要登录）
-
-    Returns:
-        导入结果
-    """
-    try:
-        logger.info(f"管理员导入 Team: {import_data.import_type}")
-
-        if import_data.import_type == "single":
-            # 单个导入 - 允许通过 AT, RT 或 ST 导入
-            if not any([import_data.access_token, import_data.refresh_token, import_data.session_token]):
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={
-                        "success": False,
-                        "error": "必须提供 Access Token、Refresh Token 或 Session Token 其中之一"
-                    }
-                )
-
-            result = await team_service.import_team_single(
-                access_token=import_data.access_token,
-                db_session=db,
-                email=import_data.email,
-                account_id=import_data.account_id,
-                refresh_token=import_data.refresh_token,
-                session_token=import_data.session_token,
-                client_id=import_data.client_id
-            )
-
-            if not result["success"]:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=result
-                )
-
-            return JSONResponse(content=result)
-
-        elif import_data.import_type == "batch":
-            # 批量导入使用 StreamingResponse
-            async def progress_generator():
-                async for status_item in team_service.import_team_batch(
-                    text=import_data.content,
-                    db_session=db
-                ):
-                    yield json.dumps(status_item, ensure_ascii=False) + "\n"
-
-            return StreamingResponse(
-                progress_generator(),
-                media_type="application/x-ndjson"
-            )
-
-        else:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "success": False,
-                    "error": "无效的导入类型"
-                }
-            )
-
-    except Exception as e:
-        logger.error(f"导入 Team 失败: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": f"导入失败: {str(e)}"
-            }
-        )
+    return JSONResponse(
+        status_code=status.HTTP_410_GONE,
+        content={
+            "success": False,
+            "error": "本地 Team 凭证导入已下线，请改为在系统设置中配置 CPA 服务、选择母号并执行同步"
+        }
+    )
 
 
 
@@ -605,38 +504,13 @@ async def batch_delete_teams(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin)
 ):
-    """
-    批量删除 Team
-    """
-    try:
-        logger.info(f"管理员批量删除 {len(action_data.ids)} 个 Team")
-        
-        success_count = 0
-        failed_count = 0
-        
-        for team_id in action_data.ids:
-            try:
-                result = await team_service.delete_team(team_id, db)
-                if result.get("success"):
-                    success_count += 1
-                else:
-                    failed_count += 1
-            except Exception as ex:
-                logger.error(f"批量删除 Team {team_id} 时出错: {ex}")
-                failed_count += 1
-        
-        return JSONResponse(content={
-            "success": True,
-            "message": f"批量删除完成: 成功 {success_count}, 失败 {failed_count}",
-            "success_count": success_count,
-            "failed_count": failed_count
-        })
-    except Exception as e:
-        logger.error(f"批量删除 Team 失败: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"success": False, "error": str(e)}
-        )
+    return JSONResponse(
+        status_code=status.HTTP_410_GONE,
+        content={
+            "success": False,
+            "error": "批量删除入口已下线。若要移除投影，请先在 CPA 母号选择中取消对应母号并重新同步"
+        }
+    )
 
 
 @router.post("/teams/batch-enable-device-auth")
@@ -1294,6 +1168,7 @@ async def settings_page(
         # 获取当前配置
         proxy_config = await settings_service.get_proxy_config(db)
         log_level = await settings_service.get_log_level(db)
+        cpa_services = await cpa_service_manager.list_services(db)
 
         return templates.TemplateResponse(
             request,
@@ -1306,7 +1181,8 @@ async def settings_page(
                 "log_level": log_level,
                 "webhook_url": await settings_service.get_setting(db, "webhook_url", ""),
                 "low_stock_threshold": await settings_service.get_setting(db, "low_stock_threshold", "10"),
-                "api_key": await settings_service.get_setting(db, "api_key", "")
+                "api_key": await settings_service.get_setting(db, "api_key", ""),
+                "cpa_services": cpa_services,
             }
         )
 
@@ -1474,3 +1350,105 @@ async def update_webhook_settings(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"success": False, "error": f"更新失败: {str(e)}"}
         )
+
+
+@router.get("/settings/cpa-services")
+async def list_cpa_services(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    return JSONResponse(content={"success": True, "services": await cpa_service_manager.list_services(db)})
+
+
+@router.post("/settings/cpa-services")
+async def create_cpa_service(
+    payload: CPAServiceRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.create_service(
+        name=payload.name,
+        api_url=payload.api_url,
+        api_token=payload.api_token or "",
+        proxy=payload.proxy or "",
+        enabled=payload.enabled,
+        db_session=db,
+    )
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/settings/cpa-services/{service_id}/update")
+async def update_cpa_service(
+    service_id: int,
+    payload: CPAServiceRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.update_service(
+        service_id,
+        name=payload.name,
+        api_url=payload.api_url,
+        api_token=payload.api_token,
+        proxy=payload.proxy or "",
+        enabled=payload.enabled,
+        db_session=db,
+    )
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/settings/cpa-services/{service_id}/delete")
+async def delete_cpa_service(
+    service_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.delete_service(service_id, db)
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/settings/cpa-services/{service_id}/test")
+async def test_cpa_service(
+    service_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.test_service(service_id, db)
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.get("/settings/cpa-services/{service_id}/auth-files")
+async def list_cpa_auth_files(
+    service_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.list_auth_files(service_id, db)
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/settings/cpa-services/{service_id}/mother-accounts")
+async def update_cpa_mother_accounts(
+    service_id: int,
+    payload: CPAMotherSelectionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.update_mother_account_selection(service_id, payload.names, db)
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/settings/cpa-services/{service_id}/sync")
+async def sync_cpa_service_selection(
+    service_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    result = await cpa_service_manager.sync_selected_accounts(service_id, db)
+    status_code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+    return JSONResponse(status_code=status_code, content=result)

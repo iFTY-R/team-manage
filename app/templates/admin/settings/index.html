@@ -7,6 +7,123 @@
     <h2>系统设置</h2>
 </div>
 
+<div class="content-section">
+    <div class="section-header">
+        <h3>CPA 服务</h3>
+        <div class="header-group">
+            <button type="button" class="btn btn-primary" onclick="openCpaServiceModal()">
+                <i data-lucide="plus-circle" style="width: 16px; height: 16px;"></i> 添加 CPA 服务
+            </button>
+        </div>
+    </div>
+
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>名称</th>
+                    <th>API URL</th>
+                    <th>代理</th>
+                    <th>状态</th>
+                    <th>最近测试</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody id="cpaServicesTableBody">
+                {% if cpa_services %}
+                    {% for service in cpa_services %}
+                    <tr>
+                        <td>{{ service.name }}</td>
+                        <td><span class="text-muted small">{{ service.api_url }}</span></td>
+                        <td>{{ service.proxy or '跟随全局代理' }}</td>
+                        <td>
+                            <span class="status-badge status-{{ 'active' if service.enabled else 'error' }}">
+                                {{ '已启用' if service.enabled else '已停用' }}
+                            </span>
+                        </td>
+                        <td>
+                            {% if service.last_tested_at %}
+                                {{ service.last_tested_at|format_datetime }}
+                                <div class="text-muted small">{{ service.last_test_status or '-' }}</div>
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                        <td>
+                            <div class="action-buttons">
+                                <button class="btn btn-sm btn-icon btn-minimal btn-info" onclick="loadMotherAccounts({{ service.id }})" title="管理母号">
+                                    <i data-lucide="database" style="width: 16px; height: 16px;"></i>
+                                </button>
+                                <button class="btn btn-sm btn-icon btn-minimal btn-primary" onclick="openCpaServiceModal({{ service.id }})" title="编辑">
+                                    <i data-lucide="edit-3" style="width: 16px; height: 16px;"></i>
+                                </button>
+                                <button class="btn btn-sm btn-icon btn-minimal btn-secondary" onclick="testCpaService({{ service.id }}, this)" title="测试连接">
+                                    <i data-lucide="plug-zap" style="width: 16px; height: 16px;"></i>
+                                </button>
+                                <button class="btn btn-sm btn-icon btn-minimal btn-danger" onclick="deleteCpaService({{ service.id }}, '{{ service.name|escape_js }}')" title="删除">
+                                    <i data-lucide="trash-2" style="width: 16px; height: 16px;"></i>
+                                </button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr>
+                        <td colspan="6" style="text-align:center; color: var(--text-muted); padding: 1.5rem;">暂无 CPA 服务，请先添加</td>
+                    </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="content-section">
+    <div class="section-header">
+        <h3>母号选择与同步</h3>
+    </div>
+
+    <div class="settings-form" style="display:flex; gap: 1rem; align-items:flex-end; flex-wrap: wrap; margin-bottom: 1rem;">
+        <div class="form-group" style="min-width: 280px; flex:1;">
+            <label for="activeCpaServiceId">选择 CPA 服务</label>
+            <select id="activeCpaServiceId" class="form-control">
+                <option value="">请选择</option>
+                {% for service in cpa_services %}
+                <option value="{{ service.id }}">{{ service.name }}</option>
+                {% endfor %}
+            </select>
+            <p class="form-help">从指定 CPA 服务拉取 `provider=codex` 的 auth-files，并选择作为系统母号。</p>
+        </div>
+        <button type="button" id="loadAuthFilesButton" class="btn btn-secondary" onclick="refreshAuthFiles()">加载凭据列表</button>
+        <button type="button" id="saveMotherAccountsButton" class="btn btn-primary" onclick="saveMotherAccountSelection()">保存选择</button>
+        <button type="button" id="syncMotherAccountsButton" class="btn btn-success" onclick="syncSelectedMotherAccounts()">立即同步</button>
+    </div>
+
+    <div id="cpaServiceStatus" class="text-muted small" style="margin-bottom: 1rem;"></div>
+
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th style="width: 40px;">选择</th>
+                    <th>文件名</th>
+                    <th>邮箱</th>
+                    <th>标签</th>
+                    <th>来源</th>
+                    <th>运行时</th>
+                    <th>状态</th>
+                    <th>最近刷新</th>
+                    <th>同步状态</th>
+                </tr>
+            </thead>
+            <tbody id="motherAccountsTableBody">
+                <tr>
+                    <td colspan="9" style="text-align:center; color: var(--text-muted); padding: 1.5rem;">请选择服务并加载凭据列表</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
 <!-- 代理配置 -->
 <div class="content-section">
     <div class="section-header">
@@ -19,7 +136,7 @@
                 <input type="checkbox" id="proxyEnabled" name="enabled" {% if proxy_enabled %}checked{% endif %}>
                 <span>启用代理</span>
             </label>
-            <p class="form-help">启用后,所有ChatGPT API请求将通过代理服务器</p>
+            <p class="form-help">启用后,所有默认外部请求将通过代理服务器</p>
         </div>
 
         <div class="form-group">
@@ -27,7 +144,7 @@
             <input type="text" id="proxyUrl" name="proxy" value="{{ proxy or '' }}"
                 placeholder="http://127.0.0.1:7890, socks5://127.0.0.1:1080 或 socks5h://127.0.0.1:1080"
                 class="form-control">
-            <p class="form-help">支持HTTP、SOCKS5和SOCKS5H (远程DNS解析) 代理</p>
+            <p class="form-help">CPA 服务未单独配置代理时，将自动回退使用这里的全局代理</p>
         </div>
 
         <button type="submit" class="btn btn-primary">保存代理配置</button>
@@ -43,20 +160,15 @@
     <form id="passwordForm" class="settings-form">
         <div class="form-group">
             <label for="oldPassword">旧密码</label>
-            <input type="password" id="oldPassword" name="old_password" required class="form-control"
-                placeholder="请输入当前密码">
+            <input type="password" id="oldPassword" name="old_password" required class="form-control" placeholder="请输入当前密码">
         </div>
-
         <div class="form-group">
             <label for="newPassword">新密码</label>
-            <input type="password" id="newPassword" name="new_password" required minlength="6" class="form-control"
-                placeholder="请输入新密码(至少6位)">
+            <input type="password" id="newPassword" name="new_password" required minlength="6" class="form-control" placeholder="请输入新密码(至少6位)">
         </div>
-
         <div class="form-group">
             <label for="confirmPassword">确认新密码</label>
-            <input type="password" id="confirmPassword" name="confirm_password" required minlength="6"
-                class="form-control" placeholder="请再次输入新密码">
+            <input type="password" id="confirmPassword" name="confirm_password" required minlength="6" class="form-control" placeholder="请再次输入新密码">
         </div>
 
         <button type="submit" class="btn btn-primary">修改密码</button>
@@ -80,7 +192,6 @@
                 <option value="ERROR" {% if log_level=='ERROR' %}selected{% endif %}>ERROR - 错误信息</option>
                 <option value="CRITICAL" {% if log_level=='CRITICAL' %}selected{% endif %}>CRITICAL - 严重错误</option>
             </select>
-            <p class="form-help">调整系统日志的详细程度,DEBUG级别会记录最详细的信息</p>
         </div>
 
         <button type="submit" class="btn btn-primary">保存日志级别</button>
@@ -98,25 +209,65 @@
             <label for="webhookUrl">Webhook URL</label>
             <input type="text" id="webhookUrl" name="webhook_url" value="{{ webhook_url or '' }}"
                 placeholder="https://your-api.com/webhook" class="form-control">
-            <p class="form-help">当系统总剩余车位低于阈值时,系统将向此URL发送POST请求</p>
         </div>
 
         <div class="form-group">
             <label for="lowStockThreshold">车位预警阈值</label>
             <input type="number" id="lowStockThreshold" name="low_stock_threshold"
                 value="{{ low_stock_threshold or '10' }}" min="0" class="form-control">
-            <p class="form-help">全系统所有活跃 Team 的总剩余车位低于或等于此数值时触发补货通知</p>
         </div>
 
         <div class="form-group">
             <label for="apiKey">API Key (用于补货对接)</label>
             <input type="text" id="apiKey" name="api_key" value="{{ api_key or '' }}"
                 placeholder="用于外部程序调用的密钥 (X-API-Key)" class="form-control">
-            <p class="form-help">设置后,第三方程序可以通过 Header `X-API-Key` 认证管理员接口</p>
         </div>
 
         <button type="submit" class="btn btn-primary">保存配置</button>
     </form>
+</div>
+
+<div id="cpaServiceModal" class="modal-overlay">
+    <div class="modal" style="max-width: 560px;">
+        <div class="modal-header">
+            <h3 id="cpaServiceModalTitle">添加 CPA 服务</h3>
+            <button class="modal-close" onclick="hideModal('cpaServiceModal')">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form id="cpaServiceForm" class="settings-form">
+                <input type="hidden" id="cpaServiceId">
+                <div class="form-group">
+                    <label for="cpaServiceName">名称 <span class="required">*</span></label>
+                    <input type="text" id="cpaServiceName" class="form-control" required placeholder="cpa">
+                </div>
+                <div class="form-group">
+                    <label for="cpaServiceUrl">API URL <span class="required">*</span></label>
+                    <input type="text" id="cpaServiceUrl" class="form-control" required placeholder="https://cpa.example.com 或 https://cpa.example.com/v0/management">
+                    <p class="form-help">支持管理根地址、`/v0/management` 或完整的 `/v0/management/auth-files` 地址</p>
+                </div>
+                <div class="form-group">
+                    <label for="cpaServiceToken">API Token</label>
+                    <input type="password" id="cpaServiceToken" class="form-control" placeholder="编辑时留空则保持原值">
+                </div>
+                <div class="form-group">
+                    <label for="cpaServiceProxy">代理地址 (可选)</label>
+                    <input type="text" id="cpaServiceProxy" class="form-control" placeholder="http://user:pass@host:port 或 socks5://host:port">
+                    <p class="form-help">留空时使用全局代理配置</p>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="cpaServiceEnabled" checked>
+                        <span>启用</span>
+                    </label>
+                </div>
+                <div style="display:flex; gap: .75rem; flex-wrap: wrap;">
+                    <button type="submit" id="saveCpaServiceButton" class="btn btn-primary">保存</button>
+                    <button type="button" id="testCpaServiceButton" class="btn btn-secondary" onclick="submitCpaServiceTest()">测试连接</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideModal('cpaServiceModal')">取消</button>
+                </div>
+            </form>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -140,145 +291,389 @@
 
 {% block extra_js %}
 <script>
-    // 代理配置表单
+    const cpaServices = {{ cpa_services|tojson|safe }};
+    let cpaServicesMap = Object.fromEntries(cpaServices.map(item => [item.id, item]));
+    let currentAuthFiles = [];
+    const ACTIVE_CPA_SERVICE_STORAGE_KEY = 'team-manage.active-cpa-service-id';
+
+    function activeServiceId() {
+        return parseInt(document.getElementById('activeCpaServiceId').value || '0', 10);
+    }
+
+    function setButtonBusy(button, busy, busyText) {
+        if (!button) return;
+        if (busy) {
+            if (!button.dataset.originalHtml) {
+                button.dataset.originalHtml = button.innerHTML;
+            }
+            button.disabled = true;
+            button.innerHTML = busyText;
+            return;
+        }
+        button.disabled = false;
+        if (button.dataset.originalHtml) {
+            button.innerHTML = button.dataset.originalHtml;
+        }
+    }
+
+    function setMotherAccountControlsBusy(busy, statusText = '') {
+        const select = document.getElementById('activeCpaServiceId');
+        const loadButton = document.getElementById('loadAuthFilesButton');
+        const saveButton = document.getElementById('saveMotherAccountsButton');
+        const syncButton = document.getElementById('syncMotherAccountsButton');
+        const statusEl = document.getElementById('cpaServiceStatus');
+
+        if (select) select.disabled = busy;
+        setButtonBusy(loadButton, busy, '加载中...');
+        setButtonBusy(saveButton, busy, '保存中...');
+        setButtonBusy(syncButton, busy, '同步中...');
+
+        document.querySelectorAll('.mother-account-checkbox').forEach(checkbox => {
+            if (busy) {
+                checkbox.disabled = true;
+                return;
+            }
+            checkbox.disabled = checkbox.dataset.selectable !== 'true' && !checkbox.checked;
+        });
+
+        if (statusEl && statusText) {
+            statusEl.textContent = statusText;
+        }
+    }
+
+    function rememberActiveServiceId(serviceId) {
+        try {
+            if (!serviceId) {
+                window.localStorage.removeItem(ACTIVE_CPA_SERVICE_STORAGE_KEY);
+                return;
+            }
+            window.localStorage.setItem(ACTIVE_CPA_SERVICE_STORAGE_KEY, String(serviceId));
+        } catch (error) {
+            console.warn('无法保存上次选择的 CPA 服务:', error);
+        }
+    }
+
+    function getRememberedActiveServiceId() {
+        try {
+            return window.localStorage.getItem(ACTIVE_CPA_SERVICE_STORAGE_KEY) || '';
+        } catch (error) {
+            console.warn('无法读取上次选择的 CPA 服务:', error);
+            return '';
+        }
+    }
+
+    function isValidCpaServiceId(value) {
+        if (!value) return false;
+        return cpaServices.some(item => String(item.id) === String(value));
+    }
+
+    function resolveInitialCpaServiceId() {
+        const rememberedId = getRememberedActiveServiceId();
+        if (cpaServices.length === 1) {
+            return String(cpaServices[0].id);
+        }
+        if (isValidCpaServiceId(rememberedId)) {
+            return String(rememberedId);
+        }
+        const currentValue = document.getElementById('activeCpaServiceId')?.value || '';
+        if (isValidCpaServiceId(currentValue)) {
+            return String(currentValue);
+        }
+        return '';
+    }
+
+    async function refreshCpaServiceList() {
+        const response = await fetch('/admin/settings/cpa-services');
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            showToast(data.error || '获取 CPA 服务失败', 'error');
+            return;
+        }
+        window.location.reload();
+    }
+
+    function openCpaServiceModal(serviceId = null) {
+        const service = serviceId ? cpaServicesMap[serviceId] : null;
+        document.getElementById('cpaServiceId').value = service ? service.id : '';
+        document.getElementById('cpaServiceName').value = service ? service.name : '';
+        document.getElementById('cpaServiceUrl').value = service ? service.api_url : '';
+        document.getElementById('cpaServiceToken').value = '';
+        document.getElementById('cpaServiceProxy').value = service ? (service.proxy || '') : '';
+        document.getElementById('cpaServiceEnabled').checked = service ? !!service.enabled : true;
+        document.getElementById('cpaServiceModalTitle').textContent = service ? '编辑 CPA 服务' : '添加 CPA 服务';
+        showModal('cpaServiceModal');
+    }
+
+    async function submitCpaServiceTest() {
+        const serviceId = document.getElementById('cpaServiceId').value;
+        if (!serviceId) {
+            showToast('请先保存服务后再测试连接', 'warning');
+            return;
+        }
+        await testCpaService(serviceId, document.getElementById('testCpaServiceButton'));
+    }
+
+    document.getElementById('cpaServiceForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const serviceId = document.getElementById('cpaServiceId').value;
+        const payload = {
+            name: document.getElementById('cpaServiceName').value.trim(),
+            api_url: document.getElementById('cpaServiceUrl').value.trim(),
+            api_token: document.getElementById('cpaServiceToken').value.trim(),
+            proxy: document.getElementById('cpaServiceProxy').value.trim(),
+            enabled: document.getElementById('cpaServiceEnabled').checked
+        };
+
+        if (!payload.name || !payload.api_url || (!serviceId && !payload.api_token)) {
+            showToast('名称、API URL、API Token 为必填项（编辑时 Token 可留空）', 'error');
+            return;
+        }
+
+        const saveButton = document.getElementById('saveCpaServiceButton');
+        setButtonBusy(saveButton, true, '保存中...');
+        try {
+            const url = serviceId ? `/admin/settings/cpa-services/${serviceId}/update` : '/admin/settings/cpa-services';
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            if (response.ok && data.success) {
+                showToast(serviceId ? 'CPA 服务已更新' : 'CPA 服务已创建', 'success');
+                hideModal('cpaServiceModal');
+                setTimeout(() => window.location.reload(), 800);
+            } else {
+                showToast(data.error || '保存失败', 'error');
+            }
+        } finally {
+            setButtonBusy(saveButton, false);
+        }
+    });
+
+    async function testCpaService(serviceId, button = null) {
+        setButtonBusy(button, true, '测试中...');
+        try {
+            const response = await fetch(`/admin/settings/cpa-services/${serviceId}/test`, { method: 'POST' });
+            const data = await response.json();
+            if (response.ok && data.success) {
+                showToast(data.message || '连接测试成功', 'success');
+                setTimeout(() => window.location.reload(), 800);
+            } else {
+                showToast(data.error || '连接测试失败', 'error');
+            }
+        } finally {
+            setButtonBusy(button, false);
+        }
+    }
+
+    async function deleteCpaService(serviceId, name) {
+        if (!confirm(`确定要删除 CPA 服务「${name}」吗？`)) return;
+        const response = await fetch(`/admin/settings/cpa-services/${serviceId}/delete`, { method: 'POST' });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            showToast('CPA 服务已删除', 'success');
+            setTimeout(() => window.location.reload(), 800);
+        } else {
+            showToast(data.error || '删除失败', 'error');
+        }
+    }
+
+    async function loadMotherAccounts(serviceId) {
+        document.getElementById('activeCpaServiceId').value = serviceId;
+        rememberActiveServiceId(serviceId);
+        await refreshAuthFiles();
+    }
+
+    async function refreshAuthFiles() {
+        const serviceId = activeServiceId();
+        const tbody = document.getElementById('motherAccountsTableBody');
+        if (!serviceId) {
+            showToast('请先选择 CPA 服务', 'warning');
+            return;
+        }
+        setMotherAccountControlsBusy(true, '正在加载 Codex 凭据列表...');
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color: var(--text-muted); padding: 1.5rem;">加载中...</td></tr>';
+        try {
+            const response = await fetch(`/admin/settings/cpa-services/${serviceId}/auth-files`);
+            const data = await response.json();
+            if (!response.ok || !data.success) {
+                tbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color: var(--danger);">${data.error || '加载失败'}</td></tr>`;
+                return;
+            }
+            currentAuthFiles = data.files || [];
+            document.getElementById('cpaServiceStatus').textContent = `已加载 ${currentAuthFiles.length} 个 Codex 凭据`;
+            if (!currentAuthFiles.length) {
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color: var(--text-muted); padding: 1.5rem;">未找到 provider=codex 的可管理凭据</td></tr>';
+                return;
+            }
+            tbody.innerHTML = currentAuthFiles.map(item => `
+                <tr>
+                    <td style="text-align:center;">
+                        <input type="checkbox" class="mother-account-checkbox" data-selectable="${item.selectable ? 'true' : 'false'}" value="${item.name}" ${item.selected ? 'checked' : ''} ${(!item.selectable && !item.selected) ? 'disabled' : ''}>
+                    </td>
+                    <td>${item.name}</td>
+                    <td>${item.email || '-'}</td>
+                    <td>${item.label || '-'}</td>
+                    <td>${item.source || '-'}</td>
+                    <td>${item.runtime_only ? '<span class="status-badge status-warning">是</span>' : '否'}</td>
+                    <td>
+                        <div>${item.status || '-'}</div>
+                        <div class="text-muted small">${item.status_message || item.not_selectable_reason || ''}</div>
+                    </td>
+                    <td>${item.last_refresh ? formatDateTime(item.last_refresh) : '-'}</td>
+                    <td>
+                        <div>${item.sync_status || '-'}</div>
+                        ${item.sync_error ? `<div class="text-danger small">${item.sync_error}</div>` : ''}
+                        ${item.upstream_missing ? '<div class="text-warning small">upstream_missing</div>' : ''}
+                    </td>
+                </tr>
+            `).join('');
+        } finally {
+            setMotherAccountControlsBusy(false);
+        }
+    }
+
+    async function saveMotherAccountSelection() {
+        const serviceId = activeServiceId();
+        if (!serviceId) {
+            showToast('请先选择 CPA 服务', 'warning');
+            return;
+        }
+        setMotherAccountControlsBusy(true, '正在保存母号选择并同步...');
+        try {
+            const names = Array.from(document.querySelectorAll('.mother-account-checkbox:checked')).map(el => el.value);
+            const response = await fetch(`/admin/settings/cpa-services/${serviceId}/mother-accounts`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ names })
+            });
+            const data = await response.json();
+            if (response.ok && data.success) {
+                showToast(data.message || '母号选择已保存，开始同步...', 'success');
+                const syncResponse = await fetch(`/admin/settings/cpa-services/${serviceId}/sync`, { method: 'POST' });
+                const syncData = await syncResponse.json();
+                if (syncResponse.ok && syncData.success) {
+                    showToast(syncData.message || '母号选择已保存并同步成功', 'success');
+                } else {
+                    showToast(`母号选择已保存，但同步失败：${syncData.error || syncData.message || '未知错误'}`, 'warning');
+                }
+                await refreshAuthFiles();
+            } else {
+                showToast(data.error || '保存失败', 'error');
+            }
+        } finally {
+            setMotherAccountControlsBusy(false);
+        }
+    }
+
+    async function syncSelectedMotherAccounts() {
+        const serviceId = activeServiceId();
+        if (!serviceId) {
+            showToast('请先选择 CPA 服务', 'warning');
+            return;
+        }
+        setMotherAccountControlsBusy(true, '正在同步选中的母号...');
+        try {
+            const response = await fetch(`/admin/settings/cpa-services/${serviceId}/sync`, { method: 'POST' });
+            const data = await response.json();
+            if (response.ok && data.success) {
+                showToast(data.message || '同步成功', 'success');
+            } else {
+                showToast(data.error || data.message || '同步失败', 'error');
+            }
+            await refreshAuthFiles();
+        } finally {
+            setMotherAccountControlsBusy(false);
+        }
+    }
+
     document.getElementById('proxyForm').addEventListener('submit', async (e) => {
         e.preventDefault();
-
         const enabled = document.getElementById('proxyEnabled').checked;
         const proxy = document.getElementById('proxyUrl').value.trim();
-
-        // 验证
         if (enabled && !proxy) {
             showToast('请输入代理地址', 'error');
             return;
         }
-
-        try {
-            const response = await fetch('/admin/settings/proxy', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ enabled, proxy })
-            });
-
-            const data = await response.json();
-
-            if (response.ok && data.success) {
-                showToast('代理配置已保存', 'success');
-            } else {
-                showToast(data.error || '保存失败', 'error');
-            }
-        } catch (error) {
-            showToast('网络错误', 'error');
-        }
+        const response = await fetch('/admin/settings/proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled, proxy })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) showToast('代理配置已保存', 'success');
+        else showToast(data.error || '保存失败', 'error');
     });
 
-    // 密码修改表单
     document.getElementById('passwordForm').addEventListener('submit', async (e) => {
         e.preventDefault();
-
         const oldPassword = document.getElementById('oldPassword').value;
         const newPassword = document.getElementById('newPassword').value;
         const confirmPassword = document.getElementById('confirmPassword').value;
-
-        // 验证
-        if (newPassword.length < 6) {
-            showToast('新密码至少6位', 'error');
-            return;
-        }
-
-        if (newPassword !== confirmPassword) {
-            showToast('两次输入的密码不一致', 'error');
-            return;
-        }
-
-        try {
-            const response = await fetch('/auth/change-password', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    old_password: oldPassword,
-                    new_password: newPassword
-                })
-            });
-
-            const data = await response.json();
-
-            if (response.ok && data.success) {
-                showToast('密码修改成功,即将跳转到登录页', 'success');
-                setTimeout(() => {
-                    window.location.href = '/login';
-                }, 2000);
-            } else {
-                showToast(data.error || '修改失败', 'error');
-            }
-        } catch (error) {
-            showToast('网络错误', 'error');
+        if (newPassword.length < 6) return showToast('新密码至少6位', 'error');
+        if (newPassword !== confirmPassword) return showToast('两次输入的密码不一致', 'error');
+        const response = await fetch('/auth/change-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            showToast('密码修改成功,即将跳转到登录页', 'success');
+            setTimeout(() => window.location.href = '/login', 1500);
+        } else {
+            showToast(data.error || '修改失败', 'error');
         }
     });
 
-    // 日志级别表单
     document.getElementById('logLevelForm').addEventListener('submit', async (e) => {
         e.preventDefault();
-
         const level = document.getElementById('logLevel').value;
-
-        try {
-            const response = await fetch('/admin/settings/log-level', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ level })
-            });
-
-            const data = await response.json();
-
-            if (response.ok && data.success) {
-                showToast('日志级别已保存', 'success');
-            } else {
-                showToast(data.error || '保存失败', 'error');
-            }
-        } catch (error) {
-            showToast('网络错误', 'error');
-        }
+        const response = await fetch('/admin/settings/log-level', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ level })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) showToast('日志级别已保存', 'success');
+        else showToast(data.error || '保存失败', 'error');
     });
 
-    // Webhook 配置表单
     document.getElementById('webhookForm').addEventListener('submit', async (e) => {
         e.preventDefault();
-
         const webhook_url = document.getElementById('webhookUrl').value.trim();
-        const low_stock_threshold = parseInt(document.getElementById('lowStockThreshold').value);
+        const low_stock_threshold = parseInt(document.getElementById('lowStockThreshold').value, 10);
         const api_key = document.getElementById('apiKey').value.trim();
-
         if (isNaN(low_stock_threshold) || low_stock_threshold < 0) {
             showToast('请输入有效的库存阈值', 'error');
             return;
         }
+        const response = await fetch('/admin/settings/webhook', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ webhook_url, low_stock_threshold, api_key })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) showToast('Webhook 配置已保存', 'success');
+        else showToast(data.error || '保存失败', 'error');
+    });
 
-        try {
-            const response = await fetch('/admin/settings/webhook', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ webhook_url, low_stock_threshold, api_key })
-            });
+    document.addEventListener('DOMContentLoaded', () => {
+        const select = document.getElementById('activeCpaServiceId');
+        if (!select) return;
 
-            const data = await response.json();
-
-            if (response.ok && data.success) {
-                showToast('Webhook 配置已保存', 'success');
-            } else {
-                showToast(data.error || '保存失败', 'error');
-            }
-        } catch (error) {
-            showToast('网络错误', 'error');
+        const initialServiceId = resolveInitialCpaServiceId();
+        if (initialServiceId) {
+            select.value = initialServiceId;
+            rememberActiveServiceId(initialServiceId);
+            refreshAuthFiles();
         }
+
+        select.addEventListener('change', () => {
+            const selectedId = select.value || '';
+            rememberActiveServiceId(selectedId);
+        });
     });
 </script>
 {% endblock %}

@@ -154,6 +154,63 @@ def run_auto_migration():
             cursor.execute("ALTER TABLE teams ADD COLUMN pending_invites INTEGER DEFAULT 0")
             migrations_applied.append("teams.pending_invites")
 
+        if not column_exists(cursor, "teams", "source_type"):
+            logger.info("添加 teams.source_type 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN source_type VARCHAR(20) DEFAULT 'local'")
+            migrations_applied.append("teams.source_type")
+
+        if not column_exists(cursor, "teams", "cpa_service_id"):
+            logger.info("添加 teams.cpa_service_id 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN cpa_service_id INTEGER")
+            migrations_applied.append("teams.cpa_service_id")
+
+        if not column_exists(cursor, "teams", "cpa_mother_account_id"):
+            logger.info("添加 teams.cpa_mother_account_id 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN cpa_mother_account_id INTEGER")
+            migrations_applied.append("teams.cpa_mother_account_id")
+
+        if not column_exists(cursor, "teams", "cpa_auth_file_name"):
+            logger.info("添加 teams.cpa_auth_file_name 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN cpa_auth_file_name VARCHAR(255)")
+            migrations_applied.append("teams.cpa_auth_file_name")
+
+        if not column_exists(cursor, "teams", "sync_status"):
+            logger.info("添加 teams.sync_status 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN sync_status VARCHAR(50) DEFAULT 'idle'")
+            migrations_applied.append("teams.sync_status")
+
+        if not column_exists(cursor, "teams", "sync_error"):
+            logger.info("添加 teams.sync_error 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN sync_error TEXT")
+            migrations_applied.append("teams.sync_error")
+
+        if not column_exists(cursor, "teams", "last_upstream_refresh_at"):
+            logger.info("添加 teams.last_upstream_refresh_at 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN last_upstream_refresh_at DATETIME")
+            migrations_applied.append("teams.last_upstream_refresh_at")
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cpa_mother_accounts'")
+        if cursor.fetchone():
+            if not column_exists(cursor, "cpa_mother_accounts", "access_token_encrypted"):
+                logger.info("添加 cpa_mother_accounts.access_token_encrypted 字段")
+                cursor.execute("ALTER TABLE cpa_mother_accounts ADD COLUMN access_token_encrypted TEXT")
+                migrations_applied.append("cpa_mother_accounts.access_token_encrypted")
+
+            if not column_exists(cursor, "cpa_mother_accounts", "refresh_token_encrypted"):
+                logger.info("添加 cpa_mother_accounts.refresh_token_encrypted 字段")
+                cursor.execute("ALTER TABLE cpa_mother_accounts ADD COLUMN refresh_token_encrypted TEXT")
+                migrations_applied.append("cpa_mother_accounts.refresh_token_encrypted")
+
+            if not column_exists(cursor, "cpa_mother_accounts", "session_token_encrypted"):
+                logger.info("添加 cpa_mother_accounts.session_token_encrypted 字段")
+                cursor.execute("ALTER TABLE cpa_mother_accounts ADD COLUMN session_token_encrypted TEXT")
+                migrations_applied.append("cpa_mother_accounts.session_token_encrypted")
+
+            if not column_exists(cursor, "cpa_mother_accounts", "client_id"):
+                logger.info("添加 cpa_mother_accounts.client_id 字段")
+                cursor.execute("ALTER TABLE cpa_mother_accounts ADD COLUMN client_id VARCHAR(100)")
+                migrations_applied.append("cpa_mother_accounts.client_id")
+
         repaired_codes = repair_warranty_timestamps(cursor)
         if repaired_codes:
             migrations_applied.append(f"repair.warranty_timestamps({repaired_codes})")

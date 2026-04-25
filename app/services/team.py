@@ -10,7 +10,7 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import Team, TeamAccount, RedemptionCode
+from app.models import Team, TeamAccount, RedemptionCode, CPAService, CPAMotherAccount
 from app.services.chatgpt import ChatGPTService
 from app.services.encryption import encryption_service
 from app.utils.token_parser import TokenParser
@@ -18,6 +18,15 @@ from app.utils.jwt_parser import JWTParser
 from app.utils.time_utils import get_now
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_dt_safe(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00").replace("+00:00", ""))
+    except Exception:
+        return None
 
 
 class TeamService:
@@ -41,6 +50,43 @@ class TeamService:
     @classmethod
     def _remaining_slots(cls, team: Team) -> int:
         return max((team.max_members or 0) - cls._occupied_slots(team), 0)
+
+    @staticmethod
+    def _team_source_type(team: Team) -> str:
+        return (getattr(team, "source_type", None) or "local").lower()
+
+    def _base_team_query(self, source_type: Optional[str] = None):
+        stmt = select(Team)
+        if source_type:
+            stmt = stmt.where(Team.source_type == source_type)
+        return stmt
+
+    async def _get_mother_account(self, team: Team, db_session: AsyncSession) -> Optional[CPAMotherAccount]:
+        stmt = None
+        if getattr(team, "cpa_mother_account_id", None):
+            stmt = select(CPAMotherAccount).where(CPAMotherAccount.id == team.cpa_mother_account_id)
+        elif getattr(team, "cpa_service_id", None) and getattr(team, "cpa_auth_file_name", None):
+            stmt = select(CPAMotherAccount).where(
+                CPAMotherAccount.service_id == team.cpa_service_id,
+                CPAMotherAccount.auth_file_name == team.cpa_auth_file_name,
+            )
+        if stmt is None:
+            return None
+        result = await db_session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def _guard_cpa_runtime_team(self, team: Team, db_session: AsyncSession) -> Optional[Dict[str, Any]]:
+        source_type = self._team_source_type(team)
+        if source_type == "legacy":
+            return {"success": False, "message": None, "error": "该 Team 已被标记为旧本地数据，请通过 CPA 母号重新同步后再操作"}
+        if source_type != "cpa":
+            return None
+        mother = await self._get_mother_account(team, db_session)
+        if not mother or not mother.selected:
+            return {"success": False, "message": None, "error": "该 Team 对应的 CPA 母号不存在、已取消选择或尚未同步"}
+        if mother.upstream_missing or (team.sync_status or "") == "upstream_missing":
+            return {"success": False, "message": None, "error": "该 Team 对应的 CPA 上游凭据已丢失或不再返回，请重新选择母号并同步"}
+        return None
 
     async def _handle_api_error(self, result: Dict[str, Any], team: Team, db_session: AsyncSession) -> bool:
         """
@@ -185,68 +231,77 @@ class TeamService:
         Returns:
             有效的 AT Token, 刷新失败返回 None
         """
+        credential_holder = team
+        linked_teams = [team]
+        if self._team_source_type(team) == "cpa":
+            mother = await self._get_mother_account(team, db_session)
+            if not mother:
+                logger.error(f"Team {team.id} 缺少关联的 CPA 母号，无法刷新 Token")
+                return None
+            credential_holder = mother
+            linked_result = await db_session.execute(
+                select(Team).where(Team.cpa_mother_account_id == mother.id)
+            )
+            linked_teams = linked_result.scalars().all() or [team]
+
         try:
-            # 1. 解密当前 Token
-            access_token = encryption_service.decrypt_token(team.access_token_encrypted)
-            
-            # 2. 检查是否过期 (如果不强制刷新且未过期，则返回)
+            access_token = encryption_service.decrypt_token(credential_holder.access_token_encrypted)
             if not force_refresh and not self.jwt_parser.is_token_expired(access_token):
                 return access_token
-                
-            if force_refresh:
-                logger.info(f"Team {team.id} ({team.email}) 强制刷新 Token")
-            else:
-                logger.info(f"Team {team.id} ({team.email}) Token 已过期, 尝试刷新")
+            logger.info(
+                f"Team {team.id} ({team.email}) {'强制刷新' if force_refresh else 'Token 已过期, 尝试刷新'}"
+            )
         except Exception as e:
             logger.error(f"解密或验证 Token 失败: {e}")
-            access_token = None # 可能是解密失败，强制走刷新流程
+            access_token = None
 
-        # 3. 尝试使用 session_token 刷新
-        if team.session_token_encrypted:
-            session_token = encryption_service.decrypt_token(team.session_token_encrypted)
+        if credential_holder.session_token_encrypted:
+            session_token = encryption_service.decrypt_token(credential_holder.session_token_encrypted)
             refresh_result = await self.chatgpt_service.refresh_access_token_with_session_token(
                 session_token, db_session, account_id=team.account_id, identifier=team.email
             )
             if refresh_result["success"]:
                 new_at = refresh_result["access_token"]
                 new_st = refresh_result.get("session_token")
-                logger.info(f"Team {team.id} 通过 session_token 成功刷新 AT")
-                team.access_token_encrypted = encryption_service.encrypt_token(new_at)
-                
-                # 如果返回了新的 session_token,予以更新
+                encrypted_at = encryption_service.encrypt_token(new_at)
+                credential_holder.access_token_encrypted = encrypted_at
+                for linked in linked_teams:
+                    linked.access_token_encrypted = encrypted_at
+                    linked.last_upstream_refresh_at = get_now()
                 if new_st and new_st != session_token:
-                    logger.info(f"Team {team.id} Session Token 已更新")
-                    team.session_token_encrypted = encryption_service.encrypt_token(new_st)
-                
-                # 成功刷新，重置错误状态
+                    encrypted_st = encryption_service.encrypt_token(new_st)
+                    credential_holder.session_token_encrypted = encrypted_st
+                    for linked in linked_teams:
+                        linked.session_token_encrypted = encrypted_st
                 await self._reset_error_status(team, db_session)
                 return new_at
-            else:
-                # 检查是否为致命错误 (如 token_invalidated)
-                if await self._handle_api_error(refresh_result, team, db_session):
-                    return None
+            if await self._handle_api_error(refresh_result, team, db_session):
+                return None
 
-        # 4. 尝试使用 refresh_token 刷新
-        if team.refresh_token_encrypted and team.client_id:
-            refresh_token = encryption_service.decrypt_token(team.refresh_token_encrypted)
+        effective_client_id = getattr(credential_holder, "client_id", None) or team.client_id
+        if credential_holder.refresh_token_encrypted and effective_client_id:
+            refresh_token = encryption_service.decrypt_token(credential_holder.refresh_token_encrypted)
             refresh_result = await self.chatgpt_service.refresh_access_token_with_refresh_token(
-                refresh_token, team.client_id, db_session, identifier=team.email
+                refresh_token, effective_client_id, db_session, identifier=team.email
             )
             if refresh_result["success"]:
                 new_at = refresh_result["access_token"]
+                encrypted_at = encryption_service.encrypt_token(new_at)
+                credential_holder.access_token_encrypted = encrypted_at
+                for linked in linked_teams:
+                    linked.access_token_encrypted = encrypted_at
+                    linked.last_upstream_refresh_at = get_now()
                 new_rt = refresh_result.get("refresh_token")
-                logger.info(f"Team {team.id} 通过 refresh_token 成功刷新 AT")
-                team.access_token_encrypted = encryption_service.encrypt_token(new_at)
                 if new_rt:
-                    team.refresh_token_encrypted = encryption_service.encrypt_token(new_rt)
-                # 成功刷新，重置错误状态
+                    encrypted_rt = encryption_service.encrypt_token(new_rt)
+                    credential_holder.refresh_token_encrypted = encrypted_rt
+                    for linked in linked_teams:
+                        linked.refresh_token_encrypted = encrypted_rt
                 await self._reset_error_status(team, db_session)
                 return new_at
-            else:
-                # 检查是否为致命错误 (如 account_deactivated)
-                if await self._handle_api_error(refresh_result, team, db_session):
-                    return None
-        
+            if await self._handle_api_error(refresh_result, team, db_session):
+                return None
+
         if team.status != "banned":
             logger.error(f"Team {team.id} Token 已过期且无法刷新，标记为 expired")
             team.status = "expired"
@@ -615,6 +670,11 @@ class TeamService:
             if not team:
                 return {"success": False, "error": f"Team ID {team_id} 不存在"}
 
+            if self._team_source_type(team) == "cpa":
+                if any([access_token, refresh_token, session_token, client_id]):
+                    return {"success": False, "error": "CPA 来源的 Team 不允许手工修改本地凭证，请改为通过 CPA 同步"}
+                return {"success": False, "error": "CPA 来源的 Team 不支持此本地编辑接口"}
+
             # 2. 更新属性
             if email:
                 team.email = email
@@ -679,13 +739,6 @@ class TeamService:
             if not team:
                 return {"success": False, "error": "Team 不存在"}
 
-            # 解密 Token
-            access_token = ""
-            try:
-                access_token = encryption_service.decrypt_token(team.access_token_encrypted)
-            except Exception as e:
-                logger.error(f"解密 Token 失败: {e}")
-
             return {
                 "success": True,
                 "team": {
@@ -693,14 +746,18 @@ class TeamService:
                     "email": team.email,
                     "account_id": team.account_id,
                     "max_members": team.max_members,
-                    "access_token": access_token,
-                    "refresh_token": encryption_service.decrypt_token(team.refresh_token_encrypted) if team.refresh_token_encrypted else "",
-                    "session_token": encryption_service.decrypt_token(team.session_token_encrypted) if team.session_token_encrypted else "",
-                    "client_id": team.client_id or "",
                     "team_name": team.team_name,
                     "status": team.status,
                     "account_role": team.account_role,
-                    "device_code_auth_enabled": team.device_code_auth_enabled
+                    "device_code_auth_enabled": team.device_code_auth_enabled,
+                    "source_type": self._team_source_type(team),
+                    "sync_status": getattr(team, "sync_status", "idle"),
+                    "sync_error": getattr(team, "sync_error", None),
+                    "last_sync": team.last_sync.isoformat() if team.last_sync else None,
+                    "last_upstream_refresh_at": team.last_upstream_refresh_at.isoformat() if getattr(team, "last_upstream_refresh_at", None) else None,
+                    "has_cached_access_token": bool(team.access_token_encrypted),
+                    "has_cached_refresh_token": bool(team.refresh_token_encrypted),
+                    "has_cached_session_token": bool(team.session_token_encrypted),
                 }
             }
         except Exception as e:
@@ -852,6 +909,10 @@ class TeamService:
                     "message": None,
                     "error": f"Team ID {team_id} 不存在"
                 }
+
+            guard = await self._guard_cpa_runtime_team(team, db_session)
+            if guard:
+                return guard
 
             # 2. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session, force_refresh=force_refresh)
@@ -1117,7 +1178,7 @@ class TeamService:
         """
         try:
             # 1. 查询所有 Team
-            stmt = select(Team)
+            stmt = select(Team).where(Team.source_type == "cpa")
             result = await db_session.execute(stmt)
             teams = result.scalars().all()
 
@@ -1202,6 +1263,10 @@ class TeamService:
                     "total": 0,
                     "error": f"Team ID {team_id} 不存在"
                 }
+
+            guard = await self._guard_cpa_runtime_team(team, db_session)
+            if guard:
+                return {"success": False, "members": [], "total": 0, "error": guard["error"]}
 
             # 2. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session)
@@ -1343,6 +1408,10 @@ class TeamService:
                     "error": f"Team ID {team_id} 不存在"
                 }
 
+            guard = await self._guard_cpa_runtime_team(team, db_session)
+            if guard:
+                return guard
+
             # 2. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session)
             if not access_token:
@@ -1436,6 +1505,10 @@ class TeamService:
                     "message": None,
                     "error": f"Team ID {team_id} 不存在"
                 }
+
+            guard = await self._guard_cpa_runtime_team(team, db_session)
+            if guard:
+                return guard
 
             # 2. 检查 Team 状态
             if team.status == "full":
@@ -1590,6 +1663,10 @@ class TeamService:
                     "error": f"Team ID {team_id} 不存在"
                 }
 
+            guard = await self._guard_cpa_runtime_team(team, db_session)
+            if guard:
+                return guard
+
             # 2. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session)
             if not access_token:
@@ -1671,6 +1748,10 @@ class TeamService:
             if not team:
                 return {"success": False, "error": f"Team ID {team_id} 不存在"}
 
+            guard = await self._guard_cpa_runtime_team(team, db_session)
+            if guard:
+                return {"success": False, "error": guard["error"]}
+
             # 2. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session)
             if not access_token:
@@ -1715,7 +1796,7 @@ class TeamService:
         """
         try:
             # 查询所有活跃 Team，再基于已加入成员和待接受邀请做容量过滤
-            stmt = select(Team).where(Team.status == "active")
+            stmt = select(Team).where(Team.status == "active", Team.source_type == "cpa")
             result = await db_session.execute(stmt)
             teams = result.scalars().all()
 
@@ -1785,29 +1866,11 @@ class TeamService:
                     "error": f"Team ID {team_id} 不存在"
                 }
 
-            # 解密 Token
-            access_token = ""
-            refresh_token = ""
-            session_token = ""
-            try:
-                if team.access_token_encrypted:
-                    access_token = encryption_service.decrypt_token(team.access_token_encrypted)
-                if team.refresh_token_encrypted:
-                    refresh_token = encryption_service.decrypt_token(team.refresh_token_encrypted)
-                if team.session_token_encrypted:
-                    session_token = encryption_service.decrypt_token(team.session_token_encrypted)
-            except Exception as e:
-                logger.error(f"解密 Team {team_id} Token 失败: {e}")
-
             # 构建返回数据
             team_data = {
                 "id": team.id,
                 "email": team.email,
                 "account_id": team.account_id,
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "session_token": session_token,
-                "client_id": team.client_id or "",
                 "team_name": team.team_name,
                 "plan_type": team.plan_type,
                 "subscription_plan": team.subscription_plan,
@@ -1818,7 +1881,16 @@ class TeamService:
                 "max_members": team.max_members,
                 "status": team.status,
                 "device_code_auth_enabled": team.device_code_auth_enabled,
+                "source_type": self._team_source_type(team),
+                "cpa_service_id": getattr(team, "cpa_service_id", None),
+                "cpa_auth_file_name": getattr(team, "cpa_auth_file_name", None),
+                "sync_status": getattr(team, "sync_status", "idle"),
+                "sync_error": getattr(team, "sync_error", None),
+                "has_cached_access_token": bool(team.access_token_encrypted),
+                "has_cached_refresh_token": bool(team.refresh_token_encrypted),
+                "has_cached_session_token": bool(team.session_token_encrypted),
                 "last_sync": team.last_sync.isoformat() if team.last_sync else None,
+                "last_upstream_refresh_at": team.last_upstream_refresh_at.isoformat() if getattr(team, "last_upstream_refresh_at", None) else None,
                 "created_at": team.created_at.isoformat() if team.created_at else None
             }
 
@@ -1855,7 +1927,8 @@ class TeamService:
         page: int = 1,
         per_page: int = 20,
         search: Optional[str] = None,
-        status: Optional[str] = None
+        status: Optional[str] = None,
+        source_type: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         获取所有 Team 列表 (用于管理员页面)
@@ -1872,7 +1945,7 @@ class TeamService:
         """
         try:
             # 1. 构建查询语句
-            stmt = select(Team)
+            stmt = self._base_team_query(source_type=source_type)
             
             # 2. 如果有搜索词,添加过滤条件
             if search:
@@ -1928,6 +2001,9 @@ class TeamService:
                     "max_members": team.max_members,
                     "status": team.status,
                     "device_code_auth_enabled": getattr(team, 'device_code_auth_enabled', False),
+                    "source_type": self._team_source_type(team),
+                    "sync_status": getattr(team, "sync_status", "idle"),
+                    "sync_error": getattr(team, "sync_error", None),
                     "last_sync": team.last_sync.isoformat() if team.last_sync else None,
                     "created_at": team.created_at.isoformat() if team.created_at else None
                 })
@@ -2024,6 +2100,13 @@ class TeamService:
                     "error": f"Team ID {team_id} 不存在"
                 }
 
+            if self._team_source_type(team) == "cpa":
+                return {
+                    "success": False,
+                    "message": None,
+                    "error": "CPA 来源的 Team 不允许本地删除，请先在 CPA 母号选择中取消后再同步"
+                }
+
             # 1.5 处理 RedemptionCode 关联 (置空)
             update_stmt = update(RedemptionCode).where(RedemptionCode.used_team_id == team_id).values(used_team_id=None)
             await db_session.execute(update_stmt)
@@ -2058,7 +2141,7 @@ class TeamService:
         """
         try:
             # 统计所有状态为 active 的 Team 的剩余位置
-            stmt = select(Team).where(Team.status == "active")
+            stmt = select(Team).where(Team.status == "active", Team.source_type != "legacy")
             result = await db_session.execute(stmt)
             teams = result.scalars().all()
             return sum(self._remaining_slots(team) for team in teams)
@@ -2073,12 +2156,12 @@ class TeamService:
         """获取 Team 统计信息"""
         try:
             # 总数
-            total_stmt = select(func.count(Team.id))
+            total_stmt = select(func.count(Team.id)).where(Team.source_type == "cpa")
             total_result = await db_session.execute(total_stmt)
             total = total_result.scalar() or 0
             
             # 可用 Team 数 (状态为 active 且未满)
-            available_stmt = select(Team).where(Team.status == "active")
+            available_stmt = select(Team).where(Team.status == "active", Team.source_type == "cpa")
             available_result = await db_session.execute(available_stmt)
             available_teams = available_result.scalars().all()
             available = sum(1 for team in available_teams if self._remaining_slots(team) > 0)
@@ -2090,6 +2173,215 @@ class TeamService:
         except Exception as e:
             logger.error(f"获取 Team 统计信息失败: {e}")
             return {"total": 0, "available": 0}
+
+    async def sync_projection_from_cpa_record(
+        self,
+        *,
+        record: Dict[str, Any],
+        cpa_service: CPAService,
+        mother_account: CPAMotherAccount,
+        db_session: AsyncSession
+    ) -> Dict[str, Any]:
+        """
+        使用 CPA 下载的记录同步到本地 Team 投影。
+        """
+        email = record.get("email")
+        account_id_hint = record.get("account_id")
+        access_token = record.get("token")
+        refresh_token = record.get("refresh_token")
+        session_token = record.get("session_token")
+        client_id = record.get("client_id")
+        last_refresh = _parse_dt_safe(record.get("last_refresh"))
+
+        if not email:
+            return {"success": False, "error": "上游凭据缺少邮箱，无法建立 Team 投影"}
+
+        # 1. 先尝试获取有效 AT
+        is_at_valid = False
+        if access_token:
+            try:
+                if not self.jwt_parser.is_token_expired(access_token):
+                    is_at_valid = True
+            except Exception:
+                pass
+
+        if not is_at_valid:
+            if session_token:
+                refresh_result = await self.chatgpt_service.refresh_access_token_with_session_token(
+                    session_token,
+                    db_session,
+                    account_id=account_id_hint,
+                    identifier=email,
+                )
+                if refresh_result["success"]:
+                    access_token = refresh_result["access_token"]
+                    session_token = refresh_result.get("session_token") or session_token
+                    mother_account.access_token_encrypted = encryption_service.encrypt_token(access_token)
+                    mother_account.session_token_encrypted = encryption_service.encrypt_token(session_token)
+                    is_at_valid = True
+
+            if not is_at_valid and refresh_token and client_id:
+                refresh_result = await self.chatgpt_service.refresh_access_token_with_refresh_token(
+                    refresh_token,
+                    client_id,
+                    db_session,
+                    identifier=email,
+                )
+                if refresh_result["success"]:
+                    access_token = refresh_result["access_token"]
+                    refresh_token = refresh_result.get("refresh_token") or refresh_token
+                    mother_account.access_token_encrypted = encryption_service.encrypt_token(access_token)
+                    mother_account.refresh_token_encrypted = encryption_service.encrypt_token(refresh_token)
+                    mother_account.client_id = client_id
+                    is_at_valid = True
+
+        if not access_token or not is_at_valid:
+            return {"success": False, "error": "上游凭据无法解析出有效 Access Token"}
+
+        token_email = self.jwt_parser.extract_email(access_token)
+        if token_email and token_email.lower() != email.lower():
+            return {"success": False, "error": f"上游 Token 身份 ({token_email}) 与母号邮箱 ({email}) 不一致"}
+
+        account_result = await self.chatgpt_service.get_account_info(access_token, db_session, identifier=email)
+        if not account_result["success"]:
+            return {"success": False, "error": f"获取账户信息失败: {account_result['error']}"}
+
+        team_accounts = [acc for acc in account_result["accounts"] if acc.get("has_active_subscription")]
+        if not team_accounts and account_result["accounts"]:
+            team_accounts = account_result["accounts"]
+        if not team_accounts:
+            return {"success": False, "error": "该母号下未发现可同步的 Team 账户"}
+
+        synced_ids = []
+        ambiguous_matches = 0
+        synced_account_ids = set()
+        for selected_account in team_accounts:
+            synced_account_ids.add(selected_account["account_id"])
+            current_members = 0
+            pending_invites = 0
+
+            members_result = await self.chatgpt_service.get_members(
+                access_token, selected_account["account_id"], db_session, identifier=email
+            )
+            invites_result = await self.chatgpt_service.get_invites(
+                access_token, selected_account["account_id"], db_session, identifier=email
+            )
+            if members_result["success"]:
+                current_members = members_result["total"]
+            if invites_result["success"]:
+                pending_invites = invites_result["total"]
+
+            settings_result = await self.chatgpt_service.get_account_settings(
+                access_token, selected_account["account_id"], db_session, identifier=email
+            )
+            beta_settings = settings_result.get("data", {}).get("beta_settings", {}) if settings_result["success"] else {}
+            device_code_auth_enabled = beta_settings.get("codex_device_code_auth", False)
+
+            expires_at = None
+            if selected_account.get("expires_at"):
+                try:
+                    expires_at = datetime.fromisoformat(selected_account["expires_at"].replace("+00:00", ""))
+                except Exception:
+                    expires_at = None
+
+            team = None
+            stmt = select(Team).where(Team.account_id == selected_account["account_id"])
+            result = await db_session.execute(stmt)
+            team = result.scalar_one_or_none()
+
+            if not team:
+                candidates_result = await db_session.execute(
+                    select(Team).where(
+                        Team.source_type != "cpa",
+                        Team.email == email,
+                    )
+                )
+                candidates = candidates_result.scalars().all()
+                if len(candidates) == 1:
+                    team = candidates[0]
+                elif len(candidates) > 1:
+                    ambiguous_matches += 1
+
+            if not team:
+                team = Team(
+                    email=email,
+                    access_token_encrypted=mother_account.access_token_encrypted or encryption_service.encrypt_token(access_token),
+                    encryption_key_id="default",
+                    account_id=selected_account["account_id"],
+                    max_members=5,
+                )
+                db_session.add(team)
+                await db_session.flush()
+
+            team.email = email
+            team.access_token_encrypted = mother_account.access_token_encrypted or encryption_service.encrypt_token(access_token)
+            team.refresh_token_encrypted = mother_account.refresh_token_encrypted or (
+                encryption_service.encrypt_token(refresh_token) if refresh_token else None
+            )
+            team.session_token_encrypted = mother_account.session_token_encrypted or (
+                encryption_service.encrypt_token(session_token) if session_token else None
+            )
+            team.client_id = mother_account.client_id or client_id
+            team.account_id = selected_account["account_id"]
+            team.team_name = selected_account.get("name")
+            team.plan_type = selected_account.get("plan_type")
+            team.subscription_plan = selected_account.get("subscription_plan")
+            team.expires_at = expires_at
+            team.current_members = current_members
+            team.pending_invites = pending_invites
+            team.account_role = selected_account.get("account_user_role")
+            team.device_code_auth_enabled = device_code_auth_enabled
+            team.source_type = "cpa"
+            team.cpa_service_id = cpa_service.id
+            team.cpa_mother_account_id = mother_account.id
+            team.cpa_auth_file_name = mother_account.auth_file_name
+            team.sync_status = "ready"
+            team.sync_error = None
+            team.last_upstream_refresh_at = last_refresh
+            team.last_sync = get_now()
+            occupied_slots = current_members + pending_invites
+            if occupied_slots >= (team.max_members or 5):
+                team.status = "full"
+            elif expires_at and expires_at < datetime.now():
+                team.status = "expired"
+            else:
+                team.status = "active"
+
+            team_accounts_stmt = select(TeamAccount).where(TeamAccount.team_id == team.id)
+            existing_accounts = (await db_session.execute(team_accounts_stmt)).scalars().all()
+            existing_map = {item.account_id: item for item in existing_accounts}
+            for acc in account_result["accounts"]:
+                account_row = existing_map.get(acc["account_id"])
+                if not account_row:
+                    account_row = TeamAccount(
+                        team_id=team.id,
+                        account_id=acc["account_id"],
+                    )
+                    db_session.add(account_row)
+                account_row.account_name = acc.get("name")
+                account_row.is_primary = acc["account_id"] == selected_account["account_id"]
+
+            synced_ids.append(team.id)
+
+        stale_projection_result = await db_session.execute(
+            select(Team).where(
+                Team.source_type == "cpa",
+                Team.cpa_service_id == cpa_service.id,
+                Team.cpa_auth_file_name == mother_account.auth_file_name,
+            )
+        )
+        for stale_team in stale_projection_result.scalars().all():
+            if stale_team.account_id in synced_account_ids:
+                continue
+            stale_team.source_type = "legacy"
+            stale_team.sync_status = "upstream_missing"
+            stale_team.sync_error = "上游母号不再返回该 Team/workspace"
+
+        await db_session.commit()
+        message = f"已同步 {len(synced_ids)} 个 Team 投影"
+        if ambiguous_matches:
+            message += f"，另有 {ambiguous_matches} 个旧本地 Team 因匹配歧义未自动回填"
+        return {"success": True, "message": message, "team_ids": synced_ids}
 
 
 # 创建全局 Team 服务实例

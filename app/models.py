@@ -32,6 +32,13 @@ class Team(Base):
     account_role = Column(String(50), comment="账号角色: account-owner/standard-user 等")
     device_code_auth_enabled = Column(Boolean, default=False, comment="是否开启设备代码身份验证")
     error_count = Column(Integer, default=0, comment="连续报错次数")
+    source_type = Column(String(20), default="local", comment="来源类型: local/cpa")
+    cpa_service_id = Column(Integer, comment="关联的 CPA 服务 ID")
+    cpa_mother_account_id = Column(Integer, comment="关联的 CPA 母号 ID")
+    cpa_auth_file_name = Column(String(255), comment="关联的 CPA Auth File 名称")
+    sync_status = Column(String(50), default="idle", comment="同步状态: idle/ready/error/upstream_missing")
+    sync_error = Column(Text, comment="同步错误信息")
+    last_upstream_refresh_at = Column(DateTime, comment="上游最后刷新时间")
     last_sync = Column(DateTime, comment="最后同步时间")
     created_at = Column(DateTime, default=get_now, comment="创建时间")
 
@@ -126,4 +133,63 @@ class Setting(Base):
     # 索引
     __table_args__ = (
         Index("idx_key", "key"),
+    )
+
+
+class CPAService(Base):
+    """CPA 服务配置表"""
+    __tablename__ = "cpa_services"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), unique=True, nullable=False, comment="CPA 服务名称")
+    api_url = Column(String(500), nullable=False, comment="管理 API 地址")
+    api_token_encrypted = Column(Text, nullable=False, comment="加密后的管理 API Token")
+    proxy = Column(String(500), comment="服务级代理地址")
+    enabled = Column(Boolean, default=True, comment="是否启用")
+    last_tested_at = Column(DateTime, comment="最近测试时间")
+    last_test_status = Column(String(20), comment="最近测试状态: success/error")
+    last_test_message = Column(Text, comment="最近测试信息")
+    created_at = Column(DateTime, default=get_now, comment="创建时间")
+    updated_at = Column(DateTime, default=get_now, onupdate=get_now, comment="更新时间")
+
+    mother_accounts = relationship("CPAMotherAccount", back_populates="service", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_cpa_services_name", "name"),
+        Index("idx_cpa_services_enabled", "enabled"),
+    )
+
+
+class CPAMotherAccount(Base):
+    """CPA 选中的母号表"""
+    __tablename__ = "cpa_mother_accounts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    service_id = Column(Integer, ForeignKey("cpa_services.id", ondelete="CASCADE"), nullable=False)
+    auth_file_name = Column(String(255), nullable=False, comment="上游 auth-file 文件名")
+    provider = Column(String(50), nullable=False, default="codex", comment="提供商")
+    email = Column(String(255), comment="展示邮箱")
+    label = Column(String(255), comment="展示标签")
+    source = Column(String(50), comment="来源: file/memory")
+    runtime_only = Column(Boolean, default=False, comment="是否仅运行时存在")
+    selected = Column(Boolean, default=True, comment="是否被选为母号")
+    upstream_status = Column(String(50), comment="上游状态")
+    upstream_status_message = Column(Text, comment="上游状态描述")
+    upstream_missing = Column(Boolean, default=False, comment="上游是否已丢失/重命名")
+    access_token_encrypted = Column(Text, comment="加密后的 AT 缓存")
+    refresh_token_encrypted = Column(Text, comment="加密后的 RT 缓存")
+    session_token_encrypted = Column(Text, comment="加密后的 ST 缓存")
+    client_id = Column(String(100), comment="镜像缓存的 Client ID")
+    last_upstream_refresh_at = Column(DateTime, comment="上游最近刷新时间")
+    last_sync = Column(DateTime, comment="最近同步时间")
+    sync_status = Column(String(50), default="idle", comment="同步状态")
+    sync_error = Column(Text, comment="同步错误信息")
+    created_at = Column(DateTime, default=get_now, comment="创建时间")
+    updated_at = Column(DateTime, default=get_now, onupdate=get_now, comment="更新时间")
+
+    service = relationship("CPAService", back_populates="mother_accounts")
+
+    __table_args__ = (
+        Index("idx_cpa_mother_service_file", "service_id", "auth_file_name", unique=True),
+        Index("idx_cpa_mother_selected", "selected"),
     )
