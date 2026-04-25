@@ -689,11 +689,31 @@ body {
     transition: var(--transition-fast);
 }
 
+.data-table th:last-child {
+    position: sticky;
+    right: 0;
+    z-index: 12;
+    background-color: var(--bg-surface);
+    box-shadow: -1px 0 0 var(--border-base);
+}
+
+.data-table td:last-child {
+    position: sticky;
+    right: 0;
+    z-index: 2;
+    background-color: var(--bg-surface);
+    box-shadow: -1px 0 0 var(--border-base);
+}
+
 .data-table tr:last-child td {
     border-bottom: none;
 }
 
 .data-table tbody tr:hover td {
+    background-color: var(--bg-main);
+}
+
+.data-table tbody tr:hover td:last-child {
     background-color: var(--bg-main);
 }
 
